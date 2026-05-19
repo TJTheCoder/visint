@@ -10,7 +10,12 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+.env
 *.local
+rl/checkpoints/*
+!rl/checkpoints/.gitkeep
+rl/replay/*
+!rl/replay/.gitkeep
 
 # Editor directories and files
 .vscode/*
