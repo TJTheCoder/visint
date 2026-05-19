@@ -16,6 +16,7 @@ rl/checkpoints/*
 !rl/checkpoints/.gitkeep
 rl/replay/*
 !rl/replay/.gitkeep
+test/
 
 # Editor directories and files
 .vscode/*

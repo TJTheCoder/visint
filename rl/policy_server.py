@@ -69,7 +69,8 @@ class FeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     episode_id: str
-    recommended_action_id: int
+    source: Literal["manual", "recommendation"]
+    recommended_action_id: int | None
     chosen_action_id: int | None
     accepted: bool
     reward: float
@@ -78,7 +79,9 @@ class FeedbackRequest(BaseModel):
 
     @field_validator("recommended_action_id")
     @classmethod
-    def validate_recommended_action_id(cls, value: int) -> int:
+    def validate_recommended_action_id(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
         if not is_valid_action_id(value):
             raise ValueError("recommended_action_id is invalid.")
         return value
@@ -116,6 +119,7 @@ async def health() -> dict[str, Any]:
         "checkpoint": trainer.last_checkpoint,
         "replay_size": replay_store.size,
         "device": str(trainer.device),
+        "traj_encoder": trainer.model.traj_encoder_name,
     }
 
 
@@ -160,11 +164,20 @@ async def recommend(payload: RecommendRequest) -> RecommendResponse:
 async def feedback(payload: FeedbackRequest) -> dict[str, Any]:
     allowed_action_ids = normalize_allowed_action_ids(payload.allowed_action_ids)
 
-    if payload.recommended_action_id not in allowed_action_ids:
-        raise HTTPException(status_code=400, detail="recommended_action_id is not allowed for this observation.")
+    if payload.source == "manual" and payload.chosen_action_id is None:
+        raise HTTPException(status_code=400, detail="manual feedback requires chosen_action_id.")
 
     if payload.chosen_action_id is not None and payload.chosen_action_id not in allowed_action_ids:
         raise HTTPException(status_code=400, detail="chosen_action_id is not in allowed_action_ids.")
+
+    if payload.source == "recommendation":
+        if payload.recommended_action_id is None:
+            raise HTTPException(status_code=400, detail="recommended_action_id is required for recommendation feedback.")
+        if payload.recommended_action_id not in allowed_action_ids:
+            raise HTTPException(status_code=400, detail="recommended_action_id is not allowed for this observation.")
+
+    if payload.source == "manual" and payload.recommended_action_id is not None:
+        raise HTTPException(status_code=400, detail="manual feedback should not include recommended_action_id.")
 
     pending = pending_recommendations.get(payload.episode_id)
     observation_dict = payload.observation.model_dump()
@@ -178,6 +191,7 @@ async def feedback(payload: FeedbackRequest) -> dict[str, Any]:
         observation=observation_dict,
         observation_vector=observation_vector,
         allowed_action_ids=allowed_action_ids,
+        source=payload.source,
         recommended_action_id=payload.recommended_action_id,
         chosen_action_id=payload.chosen_action_id,
         accepted=payload.accepted,

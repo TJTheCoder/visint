@@ -7,7 +7,7 @@
     "dev": "concurrently \"npm run server\" \"npm run client\" \"npm run rl\"",
     "client": "vite",
     "server": "nodemon server/index.js",
-    "rl": "conda run -n visint --no-capture-output uvicorn rl.policy_server:app --host 127.0.0.1 --port 8765",
+    "rl": "bash -lc 'existing=$(lsof -tiTCP:8765 -sTCP:LISTEN 2>/dev/null || true); if [ -n \"$existing\" ]; then kill $existing 2>/dev/null || true; sleep 1; fi; conda run -n visint --no-capture-output uvicorn rl.policy_server:app --host 127.0.0.1 --port 8765'",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

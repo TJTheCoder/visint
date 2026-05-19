@@ -136,16 +136,6 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-}
-
-.shutter-status {
-  margin: 0;
-  min-height: 1.1rem;
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 0.78rem;
-  letter-spacing: 0.01em;
-  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.48);
 }
 
 .captured-controls {
@@ -383,20 +373,6 @@
   overflow: visible;
 }
 
-.recommendation-message {
-  position: absolute;
-  left: 50%;
-  bottom: 124px;
-  transform: translateX(-50%);
-  margin: 0;
-  width: min(320px, calc(100% - 48px));
-  color: rgba(255, 255, 255, 0.86);
-  text-align: center;
-  font-size: 0.82rem;
-  line-height: 1.4;
-  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
-}
-
 .cancel-button-x {
   position: relative;
   z-index: 2;
@@ -404,6 +380,14 @@
   line-height: 1;
   font-weight: 300;
   transform: translateY(-1px);
+}
+
+.cancel-button-icon {
+  position: relative;
+  z-index: 2;
+  width: 30px;
+  height: 30px;
+  display: block;
 }
 
 .cancel-button-loading {

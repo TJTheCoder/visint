@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import random
 import threading
-import time
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -15,9 +15,9 @@ from torch import nn
 
 from amago.nets import transformer
 from amago.nets.tstep_encoders import FFTstepEncoder
-from amago.nets.traj_encoders import TformerTrajEncoder
+from amago.nets.traj_encoders import GRUTrajEncoder, TformerTrajEncoder
 
-from .action_space import ACTION_ID_TO_TYPE, ACTION_TYPE_TO_ID, NUM_ACTIONS, fallback_action_id, normalize_allowed_action_ids
+from .action_space import ACTION_ID_TO_TYPE, NUM_ACTIONS, fallback_action_id, normalize_allowed_action_ids
 from .featurizer import FEATURE_DIM
 from .replay_store import ReplayRecord, ReplayStore
 
@@ -37,6 +37,7 @@ class AMAGOSequencePolicy(nn.Module):
         self.max_seq_len = max_seq_len
         self.obs_dim = obs_dim
         self.num_actions = num_actions
+        self.traj_encoder_name = os.environ.get("VISINT_RL_TRAJ_ENCODER", "gru").strip().lower()
         obs_space = gym.spaces.Dict(
             {
                 "features": gym.spaces.Box(
@@ -62,24 +63,36 @@ class AMAGOSequencePolicy(nn.Module):
             obs_space=obs_space,
             rl2_space=rl2_space,
             n_layers=2,
-            d_hidden=256,
-            d_output=128,
+            d_hidden=128,
+            d_output=96,
             out_norm="layer",
             normalize_inputs=True,
         )
-        self.traj_encoder = TformerTrajEncoder(
-            tstep_dim=self.tstep_encoder.emb_dim,
-            max_seq_len=max_seq_len,
-            d_model=128,
-            n_heads=8,
-            d_ff=512,
-            n_layers=2,
-            dropout_ff=0.0,
-            dropout_emb=0.0,
-            dropout_attn=0.0,
-            dropout_qkv=0.0,
-            attention_type=attention_type,
-        )
+
+        if self.traj_encoder_name == "transformer":
+            self.traj_encoder = TformerTrajEncoder(
+                tstep_dim=self.tstep_encoder.emb_dim,
+                max_seq_len=max_seq_len,
+                d_model=128,
+                n_heads=8,
+                d_ff=512,
+                n_layers=2,
+                dropout_ff=0.0,
+                dropout_emb=0.0,
+                dropout_attn=0.0,
+                dropout_qkv=0.0,
+                attention_type=attention_type,
+            )
+        else:
+            self.traj_encoder = GRUTrajEncoder(
+                tstep_dim=self.tstep_encoder.emb_dim,
+                max_seq_len=max_seq_len,
+                d_hidden=128,
+                n_layers=2,
+                d_output=128,
+                norm="layer",
+            )
+
         self.policy_head = nn.Sequential(
             nn.LayerNorm(self.traj_encoder.emb_dim),
             nn.Linear(self.traj_encoder.emb_dim, num_actions),
@@ -176,32 +189,33 @@ class OnlinePolicyTrainer:
         if self.replay_store.size == 0:
             return
 
-        self.model.train()
+        with self.training_lock:
+            self.model.train()
 
-        for _ in range(updates):
-            batch = self._sample_batch()
-            if not batch:
-                return
+            for _ in range(updates):
+                batch = self._sample_batch()
+                if not batch:
+                    return
 
-            total_loss = torch.tensor(0.0, device=self.device)
-            effective_items = 0
+                total_loss = torch.tensor(0.0, device=self.device)
+                effective_items = 0
 
-            for record_index in batch:
-                loss = self._compute_record_loss(record_index)
-                if loss is None:
+                for record_index in batch:
+                    loss = self._compute_record_loss(record_index)
+                    if loss is None:
+                        continue
+                    total_loss = total_loss + loss
+                    effective_items += 1
+
+                if effective_items == 0:
                     continue
-                total_loss = total_loss + loss
-                effective_items += 1
 
-            if effective_items == 0:
-                continue
-
-            total_loss = total_loss / effective_items
-            self.optimizer.zero_grad(set_to_none=True)
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.train_steps += 1
+                total_loss = total_loss / effective_items
+                self.optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                self.train_steps += 1
 
         self.save_checkpoint()
 
@@ -209,11 +223,15 @@ class OnlinePolicyTrainer:
         if not self.checkpoint_path.exists():
             return
 
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.train_steps = int(checkpoint.get("train_steps", 0))
-        self.last_checkpoint = str(self.checkpoint_path)
+        try:
+            checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model"])
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self.train_steps = int(checkpoint.get("train_steps", 0))
+            self.last_checkpoint = str(self.checkpoint_path)
+        except Exception:
+            self.train_steps = 0
+            self.last_checkpoint = None
 
     def save_checkpoint(self) -> None:
         checkpoint = {
@@ -226,16 +244,14 @@ class OnlinePolicyTrainer:
 
     def _background_loop(self) -> None:
         while not self.stop_event.is_set():
-            triggered = self.training_event.wait(timeout=2.0)
+            triggered = self.training_event.wait(timeout=30.0)
             if self.stop_event.is_set():
                 return
             if not triggered:
-                if self.replay_store.size >= self.warmup_replay_size:
-                    self.train_now(updates=2)
                 continue
 
             self.training_event.clear()
-            self.train_now(updates=10)
+            self.train_now(updates=3 if self.replay_store.size < self.warmup_replay_size else 5)
 
     def _sample_batch(self) -> list[int]:
         if self.replay_store.size == 0:
@@ -253,10 +269,14 @@ class OnlinePolicyTrainer:
 
         if record.chosen_action_id is not None:
             target = torch.tensor([record.chosen_action_id], device=self.device)
-            imitation_weight = 1.0 if record.accepted else 0.35
+            imitation_weight = 1.0 if record.source == "manual" else (1.0 if record.accepted else 0.35)
             total_loss = total_loss + imitation_weight * F.cross_entropy(masked_logits, target)
 
-        if record.reward < 0 and record.recommended_action_id in record.allowed_action_ids:
+        if (
+            record.reward < 0
+            and record.recommended_action_id is not None
+            and record.recommended_action_id in record.allowed_action_ids
+        ):
             penalty_strength = min(abs(record.reward), 1.0)
             total_loss = total_loss + penalty_strength * probs[0, record.recommended_action_id]
 

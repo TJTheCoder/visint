@@ -195,7 +195,8 @@ export type RecommendationRequest = {
 
 export type FeedbackRequest = {
   episode_id: string
-  recommended_action_id: number
+  source: 'manual' | 'recommendation'
+  recommended_action_id: number | null
   chosen_action_id: number | null
   accepted: boolean
   reward: number

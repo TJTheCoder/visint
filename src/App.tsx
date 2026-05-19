@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { requestRecommendation, sendRecommendationFeedback } from './rlClient'
 import {
@@ -23,10 +23,19 @@ import {
 } from './types'
 
 type CaptureIntent = 'manual' | 'recommend'
+type CachedObservation = {
+  capturedAt: number
+  summary: string
+  sceneType: PrimarySceneType
+  contextualActions: ContextualAction[]
+  allowedActionIds: number[]
+}
 
 const defaultAnalysisError = 'Could not analyze image'
 const holdToRecommendMs = 600
 const autoOpenRecommendedSheet = false
+const showRlDebugUi = import.meta.env.VITE_SHOW_RL_DEBUG === 'true'
+const recentObservationReuseWindowMs = 20_000
 
 function AskIcon({ className }: { className: string }) {
   return (
@@ -183,6 +192,33 @@ function EventIcon({ className }: { className: string }) {
   )
 }
 
+function BrainIcon({ className }: { className: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M9.05 5.8c-1.7 0-3.08 1.36-3.08 3.04 0 .34.06.67.17.98a2.8 2.8 0 0 0-1.84 2.62c0 1.18.74 2.19 1.79 2.59a2.98 2.98 0 0 0 2.96 2.76c1.53 0 2.8-1.15 2.97-2.64V8.77A2.98 2.98 0 0 0 9.05 5.8Z"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M14.95 5.8c1.7 0 3.08 1.36 3.08 3.04 0 .34-.06.67-.17.98a2.8 2.8 0 0 1 1.84 2.62 2.77 2.77 0 0 1-1.79 2.59 2.98 2.98 0 0 1-2.96 2.76 2.99 2.99 0 0 1-2.97-2.64V8.77a2.98 2.98 0 0 1 2.97-2.97Z"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8.6 9.2c.92.22 1.62.95 1.83 1.9M8.55 12.65c1.05.23 1.9 1.02 2.18 2.04M15.4 9.2c-.92.22-1.62.95-1.83 1.9M15.45 12.65c-1.05.23-1.9 1.02-2.18 2.04M12 8.05v8.1"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
 function App() {
   const browserSupportsCamera =
     typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia)
@@ -193,6 +229,9 @@ function App() {
   const holdTimerRef = useRef<number | null>(null)
   const longPressTriggeredRef = useRef(false)
   const feedbackSentRef = useRef(false)
+  const skipNextAnalysisRef = useRef(false)
+  const cachedObservationRef = useRef<CachedObservation | null>(null)
+  const bypassRecommendationRef = useRef(false)
 
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>(
     browserSupportsCamera ? 'idle' : 'error',
@@ -317,6 +356,11 @@ function App() {
       return
     }
 
+    if (skipNextAnalysisRef.current) {
+      skipNextAnalysisRef.current = false
+      return
+    }
+
     const controller = new AbortController()
 
     const analyzeImage = async () => {
@@ -343,13 +387,23 @@ function App() {
           throw new Error(data.error || defaultAnalysisError)
         }
 
-        setAnalysisSummary(typeof data.summary === 'string' ? data.summary : '')
-        setAnalysisSceneType(data.primarySceneType || 'general')
-        setContextualActions(
+        const nextSummary = typeof data.summary === 'string' ? data.summary : ''
+        const nextSceneType = data.primarySceneType || 'general'
+        const nextActions =
           Array.isArray(data.actions)
             ? [...data.actions].sort((left, right) => right.confidence - left.confidence).slice(0, 3)
-            : [],
-        )
+            : []
+
+        setAnalysisSummary(nextSummary)
+        setAnalysisSceneType(nextSceneType)
+        setContextualActions(nextActions)
+        cachedObservationRef.current = {
+          capturedAt: Date.now(),
+          summary: nextSummary,
+          sceneType: nextSceneType,
+          contextualActions: nextActions,
+          allowedActionIds: getAllowedActionIds(nextActions),
+        }
         setAnalysisStatus('done')
       } catch (error) {
         if (controller.signal.aborted) {
@@ -373,6 +427,10 @@ function App() {
   const fallbackActions = useMemo(() => buildFallbackActions(fallbackSummary), [fallbackSummary])
   const displayedActions: DisplayAction[] = useMemo(
     () => [...contextualActions, ...fallbackActions],
+    [contextualActions, fallbackActions],
+  )
+  const keyboardActions: DisplayAction[] = useMemo(
+    () => [...fallbackActions, ...contextualActions],
     [contextualActions, fallbackActions],
   )
   const allowedActionIds = useMemo(
@@ -414,6 +472,10 @@ function App() {
         })
 
         if (controller.signal.aborted) {
+          return
+        }
+
+        if (bypassRecommendationRef.current) {
           return
         }
 
@@ -490,6 +552,8 @@ function App() {
     }
 
     const nextEpisodeId = createEpisodeId()
+    const cachedObservation = getReusableObservation(cachedObservationRef.current)
+    bypassRecommendationRef.current = false
 
     canvas.width = video.videoWidth
     canvas.height = video.videoHeight
@@ -505,38 +569,95 @@ function App() {
     feedbackSentRef.current = false
     setCaptureIntent(intent)
     setEpisodeId(nextEpisodeId)
-    setAnalysisStatus('loading')
-    setAnalysisSummary('')
-    setAnalysisSceneType('general')
-    setContextualActions([])
     setRecommendation(null)
     setRecommendationError('')
-    setRecommendationStatus(intent === 'recommend' ? 'waiting-actions' : 'idle')
     setSelectedAction(null)
     setActionFeedback('')
     setLastRewardSent(null)
+
+    if (intent === 'recommend' && cachedObservation) {
+      skipNextAnalysisRef.current = true
+      setAnalysisStatus('done')
+      setAnalysisSummary(cachedObservation.summary)
+      setAnalysisSceneType(cachedObservation.sceneType)
+      setContextualActions(cachedObservation.contextualActions)
+      setRecommendationStatus('waiting-actions')
+    } else {
+      setAnalysisStatus('loading')
+      setAnalysisSummary('')
+      setAnalysisSceneType('general')
+      setContextualActions([])
+      setRecommendationStatus(intent === 'recommend' ? 'waiting-actions' : 'idle')
+    }
+
     setCapturedImage(canvas.toDataURL('image/jpeg', 0.92))
   }
 
   const submitRecommendationFeedback = async (chosenAction: DisplayAction | null) => {
+    if (!episodeId || feedbackSentRef.current || !chosenAction) {
+      return
+    }
+
+    const chosenActionId = ACTION_TYPE_TO_ID[chosenAction.type]
+    const observation = buildRlObservation({
+      sceneType: analysisSceneType,
+      summary: fallbackSummary,
+      actions: contextualActions,
+      allowedActionIds,
+    })
+
+    const isRecommendationEpisode = captureIntent === 'recommend' && recommendation !== null
+    const accepted = isRecommendationEpisode
+      ? chosenActionId === recommendation.recommended_action_id
+      : true
+    const reward = isRecommendationEpisode
+      ? getFeedbackReward({
+          recommendedActionId: recommendation.recommended_action_id,
+          chosenActionId,
+          allowedActionIds,
+          cancelled: false,
+        })
+      : 1
+
+    const payload: FeedbackRequest = {
+      episode_id: episodeId,
+      source: isRecommendationEpisode ? 'recommendation' : 'manual',
+      recommended_action_id: isRecommendationEpisode ? recommendation.recommended_action_id : null,
+      chosen_action_id: chosenActionId,
+      accepted,
+      reward,
+      allowed_action_ids: allowedActionIds,
+      observation,
+    }
+
+    feedbackSentRef.current = true
+    setLastRewardSent(reward)
+
+    try {
+      await sendRecommendationFeedback(payload)
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : 'Could not save recommendation feedback.')
+    }
+  }
+
+  const submitRecommendationCancelFeedback = async () => {
     if (!episodeId || !recommendation || feedbackSentRef.current) {
       return
     }
 
-    const chosenActionId = chosenAction ? ACTION_TYPE_TO_ID[chosenAction.type] : null
-    const accepted = chosenActionId === recommendation.recommended_action_id
     const reward = getFeedbackReward({
       recommendedActionId: recommendation.recommended_action_id,
-      chosenActionId,
+      chosenActionId: null,
       allowedActionIds,
-      cancelled: chosenAction === null,
+      cancelled: true,
     })
 
     const payload: FeedbackRequest = {
       episode_id: episodeId,
+      source: 'recommendation',
       recommended_action_id: recommendation.recommended_action_id,
-      chosen_action_id: chosenActionId,
-      accepted,
+      chosen_action_id: null,
+      accepted: false,
       reward,
       allowed_action_ids: allowedActionIds,
       observation: buildRlObservation({
@@ -558,7 +679,9 @@ function App() {
   }
 
   const handleCancelCapture = () => {
-    void submitRecommendationFeedback(null)
+    if (captureIntent === 'recommend') {
+      void submitRecommendationCancelFeedback()
+    }
     setAnalysisStatus('idle')
     setAnalysisSummary('')
     setAnalysisSceneType('general')
@@ -579,6 +702,27 @@ function App() {
     setSelectedAction(action)
     void submitRecommendationFeedback(action)
   }
+
+  const handleKeyboardActionSelect = (action: DisplayAction) => {
+    if (captureIntent === 'recommend') {
+      bypassRecommendationRef.current = true
+      setRecommendation(null)
+      setRecommendationError('')
+      setRecommendationStatus('idle')
+    }
+
+    handleActionPress(action)
+  }
+
+  const handleKeyboardShortcut = useEffectEvent((digit: number) => {
+    const action = keyboardActions[digit - 1]
+
+    if (!action) {
+      return
+    }
+
+    handleKeyboardActionSelect(action)
+  })
 
   const handleModalAction = async () => {
     if (!selectedAction) {
@@ -680,6 +824,33 @@ function App() {
     setIsShutterHolding(false)
   }
 
+  useEffect(() => {
+    if (!capturedImage || captureIntent !== 'recommend' || selectedAction) {
+      return
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return
+      }
+
+      const digit = Number.parseInt(event.key, 10)
+
+      if (Number.isNaN(digit) || digit < 1) {
+        return
+      }
+
+      event.preventDefault()
+      handleKeyboardShortcut(digit)
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [captureIntent, capturedImage, selectedAction])
+
   return (
     <main className="app-shell">
       <section className="phone-frame" aria-label="iPhone camera demo">
@@ -741,15 +912,15 @@ function App() {
                     <p className="recommendation-message">{recommendationError}</p>
                   )}
 
-                  {captureIntent === 'recommend' && isBusy && (
-                    <p className="recommendation-message">Learning best action…</p>
-                  )}
-
                   <button
                     type="button"
                     className={`cancel-button${isBusy ? ' cancel-button-loading' : ''}`}
                     onClick={handleCancelCapture}
-                    aria-label="Close captured image"
+                    aria-label={
+                      captureIntent === 'recommend'
+                        ? 'Close suggested capture'
+                        : 'Close captured image'
+                    }
                   >
                     {isBusy && (
                       <>
@@ -757,54 +928,62 @@ function App() {
                         <span className="cancel-button-glow" aria-hidden="true" />
                       </>
                     )}
-                    <span className="cancel-button-x" aria-hidden="true">
-                      ×
-                    </span>
+                    {captureIntent === 'recommend' ? (
+                      <BrainIcon className="cancel-button-icon" />
+                    ) : (
+                      <span className="cancel-button-x" aria-hidden="true">
+                        ×
+                      </span>
+                    )}
                   </button>
 
-                  <button
-                    type="button"
-                    className="debug-toggle"
-                    onClick={() => setDebugVisible((value) => !value)}
-                  >
-                    {debugVisible ? 'Hide Debug' : 'Show Debug'}
-                  </button>
+                  {showRlDebugUi && (
+                    <>
+                      <button
+                        type="button"
+                        className="debug-toggle"
+                        onClick={() => setDebugVisible((value) => !value)}
+                      >
+                        {debugVisible ? 'Hide Debug' : 'Show Debug'}
+                      </button>
 
-                  {debugVisible && (
-                    <div className="debug-panel">
-                      <DebugRow
-                        label="Allowed"
-                        value={allowedActionIds
-                          .map((id) => ACTION_ID_TO_TYPE[id as keyof typeof ACTION_ID_TO_TYPE])
-                          .join(', ')}
-                      />
-                      <DebugRow
-                        label="Recommended"
-                        value={
-                          recommendation
-                            ? `${recommendation.recommended_action_type} (${Math.round(recommendation.confidence * 100)}%)`
-                            : captureIntent === 'recommend'
-                              ? recommendationStatus
-                              : 'None'
-                        }
-                      />
-                      <DebugRow
-                        label="Reward"
-                        value={lastRewardSent === null ? 'None sent yet' : String(lastRewardSent)}
-                      />
-                      <DebugRow
-                        label="Checkpoint"
-                        value={recommendation?.policy_debug.checkpoint || 'Not loaded yet'}
-                      />
-                      <DebugRow
-                        label="Replay"
-                        value={
-                          recommendation?.policy_debug.replay_size === undefined
-                            ? 'Unknown'
-                            : String(recommendation.policy_debug.replay_size)
-                        }
-                      />
-                    </div>
+                      {debugVisible && (
+                        <div className="debug-panel">
+                          <DebugRow
+                            label="Allowed"
+                            value={allowedActionIds
+                              .map((id) => ACTION_ID_TO_TYPE[id as keyof typeof ACTION_ID_TO_TYPE])
+                              .join(', ')}
+                          />
+                          <DebugRow
+                            label="Recommended"
+                            value={
+                              recommendation
+                                ? `${recommendation.recommended_action_type} (${Math.round(recommendation.confidence * 100)}%)`
+                                : captureIntent === 'recommend'
+                                  ? recommendationStatus
+                                  : 'None'
+                            }
+                          />
+                          <DebugRow
+                            label="Reward"
+                            value={lastRewardSent === null ? 'None sent yet' : String(lastRewardSent)}
+                          />
+                          <DebugRow
+                            label="Checkpoint"
+                            value={recommendation?.policy_debug.checkpoint || 'Not loaded yet'}
+                          />
+                          <DebugRow
+                            label="Replay"
+                            value={
+                              recommendation?.policy_debug.replay_size === undefined
+                                ? 'Unknown'
+                                : String(recommendation.policy_debug.replay_size)
+                            }
+                          />
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               ) : (
@@ -817,11 +996,6 @@ function App() {
                   </button>
 
                   <div className="shutter-cluster">
-                    {isShutterHolding && (
-                      <p className="shutter-status" role="status">
-                        Learning best action…
-                      </p>
-                    )}
                     <button
                       type="button"
                       className={`shutter-button${isShutterHolding ? ' shutter-button-holding' : ''}`}
@@ -1083,6 +1257,18 @@ function getFeedbackReward({
   }
 
   return -0.2
+}
+
+function getReusableObservation(cachedObservation: CachedObservation | null) {
+  if (!cachedObservation) {
+    return null
+  }
+
+  if (Date.now() - cachedObservation.capturedAt > recentObservationReuseWindowMs) {
+    return null
+  }
+
+  return cachedObservation
 }
 
 function getActionButtonLabel(action: DisplayAction) {

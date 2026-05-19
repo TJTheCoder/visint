@@ -19,7 +19,18 @@ SCENE_TYPES = (
 )
 
 SCENE_TYPE_TO_ID = {scene_type: idx for idx, scene_type in enumerate(SCENE_TYPES)}
-FEATURE_DIM = len(SCENE_TYPES) + NUM_ACTIONS + NUM_ACTIONS + 8 + NUM_ACTIONS + NUM_ACTIONS + 1
+SEMANTIC_HASH_BUCKETS = 16
+FEATURE_DIM = (
+    len(SCENE_TYPES)
+    + NUM_ACTIONS
+    + NUM_ACTIONS
+    + NUM_ACTIONS
+    + 8
+    + SEMANTIC_HASH_BUCKETS
+    + NUM_ACTIONS
+    + NUM_ACTIONS
+    + 1
+)
 
 
 @dataclass(slots=True)
@@ -41,12 +52,15 @@ def build_observation_vector(
 
     scene_one_hot = one_hot_scene(scene_type)
     allowed_mask = action_mask_from_ids(allowed_action_ids)
+    detected_action_mask = [0.0] * NUM_ACTIONS
     confidence_by_action = [0.0] * NUM_ACTIONS
 
     for action in actions:
         action_type = action.get("type")
         if action_type in ACTION_TYPE_TO_ID:
-            confidence_by_action[ACTION_TYPE_TO_ID[action_type]] = float(action.get("confidence", 0.0))
+            action_id = ACTION_TYPE_TO_ID[action_type]
+            detected_action_mask[action_id] = 1.0
+            confidence_by_action[action_id] = float(action.get("confidence", 0.0))
 
     text_blob = build_text_blob(summary, actions)
     text_features = [
@@ -59,6 +73,7 @@ def build_observation_vector(
         float(has_foreign_text(text_blob)),
         float(has_math_problem(text_blob)),
     ]
+    semantic_hash_features = hash_semantic_text(summary, actions)
 
     previous_recommended = one_hot_action(history.last_recommended_action_id)
     previous_chosen = one_hot_action(history.last_chosen_action_id)
@@ -67,8 +82,10 @@ def build_observation_vector(
     return [
         *scene_one_hot,
         *allowed_mask,
+        *detected_action_mask,
         *confidence_by_action,
         *text_features,
+        *semantic_hash_features,
         *previous_recommended,
         *previous_chosen,
         *previous_reward,
@@ -84,6 +101,44 @@ def build_text_blob(summary: str, actions: list[dict[str, Any]]) -> str:
             payload_text.append(json.dumps(payload, ensure_ascii=False))
 
     return f"{summary}\n" + "\n".join(payload_text)
+
+
+def hash_semantic_text(summary: str, actions: list[dict[str, Any]]) -> list[float]:
+    buckets = [0.0] * SEMANTIC_HASH_BUCKETS
+    token_counts = [0] * SEMANTIC_HASH_BUCKETS
+    semantic_parts = [summary]
+
+    for action in actions:
+        action_type = str(action.get("type") or "")
+        label = str(action.get("label") or "")
+        semantic_parts.append(action_type)
+        semantic_parts.append(label)
+        payload = action.get("payload")
+        if payload:
+            semantic_parts.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+    semantic_text = " ".join(part for part in semantic_parts if part).lower()
+    tokens = re.findall(r"[a-z0-9_@.$:/+-]+", semantic_text)
+
+    if not tokens:
+        return buckets
+
+    for token in tokens:
+        bucket = stable_bucket(token, SEMANTIC_HASH_BUCKETS)
+        token_counts[bucket] += 1
+
+    max_count = max(token_counts) or 1
+    for index, count in enumerate(token_counts):
+        buckets[index] = count / max_count
+
+    return buckets
+
+
+def stable_bucket(token: str, bucket_count: int) -> int:
+    value = 0
+    for character in token:
+        value = (value * 131 + ord(character)) % 2_147_483_647
+    return value % bucket_count
 
 
 def one_hot_scene(scene_type: str) -> list[float]:

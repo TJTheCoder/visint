@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 
-from .featurizer import HistoryState
+from .featurizer import HistoryState, build_observation_vector
 
 
 @dataclass(slots=True)
@@ -14,7 +14,8 @@ class ReplayRecord:
     observation: dict
     observation_vector: list[float]
     allowed_action_ids: list[int]
-    recommended_action_id: int
+    source: str
+    recommended_action_id: int | None
     chosen_action_id: int | None
     accepted: bool
     reward: float
@@ -36,6 +37,9 @@ class ReplayStore:
         if not self.replay_path.exists():
             return
 
+        migrated_records: list[ReplayRecord] = []
+        history = HistoryState()
+
         with self.replay_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -44,9 +48,30 @@ class ReplayStore:
 
                 try:
                     payload = json.loads(line)
-                    self.records.append(ReplayRecord(**payload))
+                    observation = payload["observation"]
+                    observation_vector = build_observation_vector(observation, history)
+                    record = ReplayRecord(
+                        episode_id=payload["episode_id"],
+                        observation=observation,
+                        observation_vector=observation_vector,
+                        allowed_action_ids=payload["allowed_action_ids"],
+                        source=payload["source"],
+                        recommended_action_id=payload.get("recommended_action_id"),
+                        chosen_action_id=payload.get("chosen_action_id"),
+                        accepted=payload["accepted"],
+                        reward=payload["reward"],
+                        created_at=payload["created_at"],
+                    )
+                    migrated_records.append(record)
+                    history = HistoryState(
+                        last_recommended_action_id=record.recommended_action_id,
+                        last_chosen_action_id=record.chosen_action_id,
+                        last_reward=record.reward,
+                    )
                 except Exception:
                     continue
+
+        self.records = migrated_records
 
     def append(
         self,
@@ -55,7 +80,8 @@ class ReplayStore:
         observation: dict,
         observation_vector: list[float],
         allowed_action_ids: list[int],
-        recommended_action_id: int,
+        source: str,
+        recommended_action_id: int | None,
         chosen_action_id: int | None,
         accepted: bool,
         reward: float,
@@ -65,6 +91,7 @@ class ReplayStore:
             observation=observation,
             observation_vector=observation_vector,
             allowed_action_ids=allowed_action_ids,
+            source=source,
             recommended_action_id=recommended_action_id,
             chosen_action_id=chosen_action_id,
             accepted=accepted,
