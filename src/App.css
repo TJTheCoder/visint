@@ -323,6 +323,11 @@
   cursor: pointer;
 }
 
+.action-pill:disabled {
+  cursor: wait;
+  opacity: 0.54;
+}
+
 .action-pill-contextual {
   background: rgba(9, 9, 9, 0.78);
 }
@@ -388,6 +393,20 @@
   width: 30px;
   height: 30px;
   display: block;
+}
+
+.recommendation-message {
+  position: absolute;
+  left: 50%;
+  bottom: 124px;
+  transform: translateX(-50%);
+  margin: 0;
+  width: min(320px, calc(100% - 48px));
+  color: rgba(255, 255, 255, 0.86);
+  text-align: center;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
 }
 
 .cancel-button-loading {
@@ -566,6 +585,49 @@
   gap: 10px;
 }
 
+.payload-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.payload-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.payload-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.22);
+  color: #ffffff;
+  font: inherit;
+  font-size: 0.92rem;
+  line-height: 1.4;
+  padding: 10px 12px;
+  outline: none;
+}
+
+.payload-input::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.payload-input:focus {
+  border-color: rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
+}
+
+.payload-textarea {
+  resize: vertical;
+  min-height: 84px;
+}
+
 .payload-row {
   display: flex;
   justify-content: space-between;
@@ -593,6 +655,14 @@
   font-size: 0.92rem;
   line-height: 1.4;
   word-break: break-word;
+}
+
+.payload-value-left {
+  text-align: left;
+}
+
+.payload-error {
+  color: #ffb4b4;
 }
 
 .payload-list {
@@ -642,6 +712,16 @@
 .sheet-primary {
   background: #ffffff;
   color: #0a0a0a;
+}
+
+.sheet-primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.sheet-inline-button {
+  flex: none;
+  width: 100%;
 }
 
 .sheet-secondary {

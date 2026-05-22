@@ -184,6 +184,7 @@ export type RecommendationDebug = {
 export type RecommendationResponse = {
   recommended_action_id: number
   recommended_action_type: RLActionType
+  recommended_params: Record<string, unknown>
   confidence: number
   policy_debug: RecommendationDebug
 }
@@ -198,6 +199,8 @@ export type FeedbackRequest = {
   source: 'manual' | 'recommendation'
   recommended_action_id: number | null
   chosen_action_id: number | null
+  recommended_params?: Record<string, unknown> | null
+  chosen_params?: Record<string, unknown> | null
   accepted: boolean
   reward: number
   allowed_action_ids: number[]

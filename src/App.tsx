@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type FormEvent } from 'react'
 import './App.css'
 import { requestRecommendation, sendRecommendationFeedback } from './rlClient'
 import {
@@ -18,11 +18,18 @@ import {
   type PrimarySceneType,
   type RecommendationResponse,
   type RecommendationStatus,
+  type RLActionType,
   type RLObservation,
   type SetReminderAction,
 } from './types'
 
 type CaptureIntent = 'manual' | 'recommend'
+type SavedActionPreset = {
+  actionType: RLActionType
+  label: string
+  params: Record<string, unknown>
+  savedAt: number
+}
 type CachedObservation = {
   capturedAt: number
   summary: string
@@ -33,9 +40,10 @@ type CachedObservation = {
 
 const defaultAnalysisError = 'Could not analyze image'
 const holdToRecommendMs = 600
-const autoOpenRecommendedSheet = false
+const autoOpenRecommendedSheet = true
 const showRlDebugUi = import.meta.env.VITE_SHOW_RL_DEBUG === 'true'
 const recentObservationReuseWindowMs = 20_000
+const savedActionPresetsKey = 'visint.numberActionPresets.v1'
 
 function AskIcon({ className }: { className: string }) {
   return (
@@ -232,6 +240,8 @@ function App() {
   const skipNextAnalysisRef = useRef(false)
   const cachedObservationRef = useRef<CachedObservation | null>(null)
   const bypassRecommendationRef = useRef(false)
+  const latestActionPresetRef = useRef<SavedActionPreset | null>(null)
+  const savedActionPresetsRef = useRef<Record<string, SavedActionPreset>>(loadSavedActionPresets())
 
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>(
     browserSupportsCamera ? 'idle' : 'error',
@@ -254,6 +264,12 @@ function App() {
   const [lastRewardSent, setLastRewardSent] = useState<number | null>(null)
   const [debugVisible, setDebugVisible] = useState(false)
   const [isShutterHolding, setIsShutterHolding] = useState(false)
+  const [askQuestion, setAskQuestion] = useState('')
+  const [askAnswer, setAskAnswer] = useState('')
+  const [askStatus, setAskStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
+  const [translateLanguage, setTranslateLanguage] = useState('')
+  const [customTranslation, setCustomTranslation] = useState('')
+  const [translateStatus, setTranslateStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
 
   useEffect(() => {
     let cancelled = false
@@ -429,14 +445,81 @@ function App() {
     () => [...contextualActions, ...fallbackActions],
     [contextualActions, fallbackActions],
   )
-  const keyboardActions: DisplayAction[] = useMemo(
-    () => [...fallbackActions, ...contextualActions],
-    [contextualActions, fallbackActions],
-  )
   const allowedActionIds = useMemo(
     () => getAllowedActionIds(contextualActions),
     [contextualActions],
   )
+
+  function applyRecommendationParams(nextRecommendation: RecommendationResponse) {
+    if (nextRecommendation.recommended_action_type === 'TRANSLATE') {
+      const targetLanguage = getRecommendedParamString(nextRecommendation, 'targetLanguage')
+      if (targetLanguage) {
+        setTranslateLanguage(targetLanguage)
+      }
+    }
+
+    if (nextRecommendation.recommended_action_type === 'ASK') {
+      const question = getRecommendedParamString(nextRecommendation, 'question')
+      if (question) {
+        setAskQuestion(question)
+      }
+    }
+  }
+
+  function applyPresetParams(preset: SavedActionPreset) {
+    if (preset.actionType === 'TRANSLATE') {
+      const targetLanguage = getStringParam(preset.params, 'targetLanguage')
+      if (targetLanguage) {
+        setTranslateLanguage(targetLanguage)
+      }
+      setCustomTranslation(getStringParam(preset.params, 'translation') || '')
+      setTranslateStatus('idle')
+    }
+
+    if (preset.actionType === 'ASK') {
+      const question = getStringParam(preset.params, 'question')
+      if (question) {
+        setAskQuestion(question)
+      }
+      setAskAnswer(getStringParam(preset.params, 'answer') || '')
+      setAskStatus('idle')
+    }
+  }
+
+  function rememberLatestActionPreset(action: DisplayAction, extraParams: Record<string, unknown> = {}) {
+    latestActionPresetRef.current = buildActionPreset({
+      action,
+      summary: fallbackSummary,
+      contextualActions,
+      recommendation: action.type === recommendationTargetType ? recommendation : null,
+      askQuestion,
+      askAnswer,
+      translateLanguage,
+      customTranslation,
+      extraParams,
+    })
+  }
+
+  function getCurrentActionPreset() {
+    if (selectedAction) {
+      rememberLatestActionPreset(selectedAction)
+    }
+
+    return latestActionPresetRef.current
+  }
+
+  function saveNumberPreset(numberKey: string, preset: SavedActionPreset) {
+    const nextPreset = {
+      ...preset,
+      savedAt: Date.now(),
+    }
+    savedActionPresetsRef.current = {
+      ...savedActionPresetsRef.current,
+      [numberKey]: nextPreset,
+    }
+    saveSavedActionPresets(savedActionPresetsRef.current)
+    setActionFeedback(`Saved ${nextPreset.label} to ${formatPresetKeyLabel(numberKey)}.`)
+  }
 
   useEffect(() => {
     if (!capturedImage || captureIntent !== 'recommend') {
@@ -483,17 +566,19 @@ function App() {
         const safeResponse = allowedSet.has(response.recommended_action_id)
           ? response
           : {
-              ...response,
-              recommended_action_id: getFallbackActionId(allowedActionIds),
-              recommended_action_type:
-                ACTION_ID_TO_TYPE[getFallbackActionId(allowedActionIds) as keyof typeof ACTION_ID_TO_TYPE],
-              policy_debug: {
-                ...response.policy_debug,
-                warning: 'Frontend replaced an invalid recommendation with a safe fallback.',
+            ...response,
+            recommended_action_id: getFallbackActionId(allowedActionIds),
+            recommended_action_type:
+              ACTION_ID_TO_TYPE[getFallbackActionId(allowedActionIds) as keyof typeof ACTION_ID_TO_TYPE],
+            recommended_params: {},
+            policy_debug: {
+              ...response.policy_debug,
+              warning: 'Frontend replaced an invalid recommendation with a safe fallback.',
               },
             }
 
         setRecommendation(safeResponse)
+        applyRecommendationParams(safeResponse)
         setRecommendationStatus('done')
 
         if (autoOpenRecommendedSheet) {
@@ -539,6 +624,15 @@ function App() {
     recommendationStatus === 'loading'
   const recommendationTargetType = recommendation?.recommended_action_type || null
 
+  const resetInteractiveActionState = () => {
+    setAskQuestion('')
+    setAskAnswer('')
+    setAskStatus('idle')
+    setTranslateLanguage('')
+    setCustomTranslation('')
+    setTranslateStatus('idle')
+  }
+
   const handleCapture = (intent: CaptureIntent) => {
     if (!videoRef.current || !canvasRef.current || cameraStatus !== 'ready') {
       return
@@ -573,6 +667,7 @@ function App() {
     setRecommendationError('')
     setSelectedAction(null)
     setActionFeedback('')
+    resetInteractiveActionState()
     setLastRewardSent(null)
 
     if (intent === 'recommend' && cachedObservation) {
@@ -624,6 +719,8 @@ function App() {
       source: isRecommendationEpisode ? 'recommendation' : 'manual',
       recommended_action_id: isRecommendationEpisode ? recommendation.recommended_action_id : null,
       chosen_action_id: chosenActionId,
+      recommended_params: isRecommendationEpisode ? recommendation.recommended_params : null,
+      chosen_params: getChosenActionParams(chosenAction, recommendation),
       accepted,
       reward,
       allowed_action_ids: allowedActionIds,
@@ -691,19 +788,66 @@ function App() {
     setRecommendationStatus('idle')
     setSelectedAction(null)
     setActionFeedback('')
+    resetInteractiveActionState()
     setCapturedImage(null)
     setEpisodeId(null)
     setLastRewardSent(null)
     feedbackSentRef.current = false
   }
 
-  const handleActionPress = (action: DisplayAction) => {
+  const handleActionPress = (action: DisplayAction, preset: SavedActionPreset | null = null) => {
+    if (!canRunProcessedAction(action, analysisStatus)) {
+      setActionFeedback('Image analysis is still finishing.')
+      return
+    }
+
     setActionFeedback('')
-    setSelectedAction(action)
+    rememberLatestActionPreset(action)
     void submitRecommendationFeedback(action)
+
+    if (action.type === 'SEARCH') {
+      window.open(
+        buildSearchUrl(
+          fallbackSummary,
+          contextualActions,
+          getStringParam(preset?.params ?? {}, 'query') ||
+            (recommendationTargetType === 'SEARCH' ? getRecommendedParamString(recommendation, 'query') : null),
+        ),
+        '_blank',
+        'noopener,noreferrer',
+      )
+      return
+    }
+
+    if (action.type === 'OPEN_LINK') {
+      window.open(
+        getStringParam(preset?.params ?? {}, 'url') ||
+        (recommendationTargetType === 'OPEN_LINK'
+          ? getRecommendedParamString(recommendation, 'url') || action.payload.url
+          : action.payload.url),
+        '_blank',
+        'noopener,noreferrer',
+      )
+      return
+    }
+
+    resetInteractiveActionState()
+    if (preset) {
+      applyPresetParams(preset)
+    } else if (action.type === recommendationTargetType && recommendation) {
+      applyRecommendationParams(recommendation)
+    }
+    setSelectedAction(action)
   }
 
-  const handleKeyboardActionSelect = (action: DisplayAction) => {
+  const handleSavedPresetSelect = (preset: SavedActionPreset) => {
+    const action = displayedActions.find((displayedAction) => displayedAction.type === preset.actionType)
+
+    if (!action || !canRunProcessedAction(action, analysisStatus)) {
+      setRecommendationError('Saved action is not available for this image.')
+      return
+    }
+
     if (captureIntent === 'recommend') {
       bypassRecommendationRef.current = true
       setRecommendation(null)
@@ -711,17 +855,91 @@ function App() {
       setRecommendationStatus('idle')
     }
 
-    handleActionPress(action)
+    handleActionPress(action, preset)
   }
 
-  const handleKeyboardShortcut = useEffectEvent((digit: number) => {
-    const action = keyboardActions[digit - 1]
+  const handleNumberPresetKey = useEffectEvent((event: KeyboardEvent) => {
+    if (isControlKey(event)) {
+      if (!capturedImage || captureIntent !== 'recommend' || selectedAction) {
+        return
+      }
 
-    if (!action) {
+      const preset = latestActionPresetRef.current
+      if (!preset) {
+        return
+      }
+
+      event.preventDefault()
+      handleSavedPresetSelect(preset)
       return
     }
 
-    handleKeyboardActionSelect(action)
+    if (isBacktickKey(event)) {
+      if (shouldIgnoreNumpadSave(event)) {
+        return
+      }
+
+      const preset = getCurrentActionPreset()
+      if (!preset) {
+        return
+      }
+
+      event.preventDefault()
+      saveNumberPreset('`', preset)
+      return
+    }
+
+    if (isEscapeKey(event)) {
+      if (!capturedImage || captureIntent !== 'recommend' || selectedAction) {
+        return
+      }
+
+      const preset = savedActionPresetsRef.current['`']
+      if (!preset) {
+        return
+      }
+
+      event.preventDefault()
+      handleSavedPresetSelect(preset)
+      return
+    }
+
+    const numberKey = getNumberKey(event)
+
+    if (!numberKey) {
+      return
+    }
+
+    if (numberKey.source === 'numpad') {
+      if (shouldIgnoreNumpadSave(event)) {
+        return
+      }
+
+      const preset = getCurrentActionPreset()
+      if (!preset) {
+        return
+      }
+
+      event.preventDefault()
+      saveNumberPreset(numberKey.value, preset)
+      return
+    }
+
+    if (numberKey.source !== 'top-row') {
+      return
+    }
+
+    if (!capturedImage || captureIntent !== 'recommend' || selectedAction) {
+      return
+    }
+
+    const preset = savedActionPresetsRef.current[numberKey.value]
+    if (!preset) {
+      return
+    }
+
+    event.preventDefault()
+    handleSavedPresetSelect(preset)
   })
 
   const handleModalAction = async () => {
@@ -732,7 +950,7 @@ function App() {
     try {
       switch (selectedAction.type) {
         case 'TRANSLATE':
-          await navigator.clipboard.writeText(selectedAction.payload.translatedText)
+          await navigator.clipboard.writeText(customTranslation || selectedAction.payload.translatedText)
           setActionFeedback('Translation copied.')
           break
         case 'OPEN_LINK':
@@ -783,6 +1001,93 @@ function App() {
     }
   }
 
+  const handleAskSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    if (!capturedImage || !askQuestion.trim()) {
+      return
+    }
+
+    setAskStatus('loading')
+    setAskAnswer('')
+    setActionFeedback('')
+
+    try {
+      const response = await fetch('/api/ask-image', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          imageDataUrl: capturedImage,
+          question: askQuestion.trim(),
+          summary: analysisSummary,
+        }),
+      })
+      const data = (await response.json()) as { answer?: string; error?: string }
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not answer that question.')
+      }
+
+      setAskAnswer(data.answer || 'No answer returned.')
+      setAskStatus('done')
+      if (selectedAction) {
+        rememberLatestActionPreset(selectedAction, {
+          question: askQuestion.trim(),
+          answer: data.answer || '',
+        })
+      }
+    } catch (error) {
+      setAskStatus('error')
+      setAskAnswer(error instanceof Error ? error.message : 'Could not answer that question.')
+    }
+  }
+
+  const handleTranslateSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    if (!capturedImage || !translateLanguage.trim() || !selectedAction || selectedAction.type !== 'TRANSLATE') {
+      return
+    }
+
+    setTranslateStatus('loading')
+    setCustomTranslation('')
+    setActionFeedback('')
+
+    try {
+      const response = await fetch('/api/translate-image', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          imageDataUrl: capturedImage,
+          targetLanguage: translateLanguage.trim(),
+          detectedText: selectedAction.payload.detectedText,
+          summary: analysisSummary,
+        }),
+      })
+      const data = (await response.json()) as { translation?: string; error?: string }
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not translate the image text.')
+      }
+
+      setCustomTranslation(data.translation || 'No translation returned.')
+      setTranslateStatus('done')
+      if (selectedAction) {
+        rememberLatestActionPreset(selectedAction, {
+          targetLanguage: translateLanguage.trim(),
+          translation: data.translation || '',
+        })
+      }
+    } catch (error) {
+      setTranslateStatus('error')
+      setCustomTranslation(error instanceof Error ? error.message : 'Could not translate the image text.')
+    }
+  }
+
   const clearHoldTimer = () => {
     if (holdTimerRef.current !== null) {
       window.clearTimeout(holdTimerRef.current)
@@ -825,23 +1130,12 @@ function App() {
   }
 
   useEffect(() => {
-    if (!capturedImage || captureIntent !== 'recommend' || selectedAction) {
-      return
-    }
-
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey) {
+      if (event.metaKey || event.altKey || (event.ctrlKey && !isControlKey(event))) {
         return
       }
 
-      const digit = Number.parseInt(event.key, 10)
-
-      if (Number.isNaN(digit) || digit < 1) {
-        return
-      }
-
-      event.preventDefault()
-      handleKeyboardShortcut(digit)
+      handleNumberPresetKey(event)
     }
 
     window.addEventListener('keydown', handleKeyDown)
@@ -849,7 +1143,7 @@ function App() {
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
     }
-  }, [captureIntent, capturedImage, selectedAction])
+  }, [])
 
   return (
     <main className="app-shell">
@@ -893,12 +1187,14 @@ function App() {
                   <div className="captured-actions">
                     {displayedActions.map((action) => {
                       const isRecommended = action.type === recommendationTargetType
+                      const isActionReady = canRunProcessedAction(action, analysisStatus)
                       return (
                         <button
                           key={`${action.type}-${action.label}`}
                           type="button"
                           className={`action-pill${isContextualAction(action) ? ' action-pill-contextual' : ''}${isRecommended ? ' recommended-action' : ''}`}
                           onClick={() => handleActionPress(action)}
+                          disabled={!isActionReady}
                         >
                           <ActionIcon actionType={action.type} className="pill-icon" />
                           <span>{action.label}</span>
@@ -1063,15 +1359,25 @@ function App() {
                     </div>
 
                     <div className="action-sheet-body">
-                      {!isContextualAction(selectedAction) ? (
-                        <div className="payload-stack">
-                          <div className="payload-row">
-                            <span className="payload-key">Summary</span>
-                            <span className="payload-value">
-                              {selectedAction.payload.summary || 'Captured image ready for Ask or Search.'}
-                            </span>
-                          </div>
-                        </div>
+                      {selectedAction.type === 'ASK' ? (
+                        <AskPayload
+                          question={askQuestion}
+                          answer={askAnswer}
+                          status={askStatus}
+                          onQuestionChange={setAskQuestion}
+                          onSubmit={handleAskSubmit}
+                        />
+                      ) : selectedAction.type === 'TRANSLATE' ? (
+                        <TranslatePayload
+                          action={selectedAction}
+                          language={translateLanguage}
+                          translation={customTranslation}
+                          status={translateStatus}
+                          onLanguageChange={setTranslateLanguage}
+                          onSubmit={handleTranslateSubmit}
+                        />
+                      ) : !isContextualAction(selectedAction) ? (
+                        <FallbackPayload action={selectedAction} />
                       ) : (
                         renderActionPayload(selectedAction)
                       )}
@@ -1109,6 +1415,96 @@ function DebugRow({ label, value }: { label: string; value: string }) {
     <div className="debug-row">
       <span className="debug-key">{label}</span>
       <span className="debug-value">{value}</span>
+    </div>
+  )
+}
+
+function AskPayload({
+  question,
+  answer,
+  status,
+  onQuestionChange,
+  onSubmit,
+}: {
+  question: string
+  answer: string
+  status: 'idle' | 'loading' | 'done' | 'error'
+  onQuestionChange: (value: string) => void
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+}) {
+  return (
+    <form className="payload-form" onSubmit={onSubmit}>
+      <label className="payload-field">
+        <span className="payload-key">Question</span>
+        <textarea
+          className="payload-input payload-textarea"
+          value={question}
+          onChange={(event) => onQuestionChange(event.target.value)}
+          placeholder="Ask something about this image"
+          rows={3}
+        />
+      </label>
+      <button type="submit" className="sheet-primary sheet-inline-button" disabled={status === 'loading' || !question.trim()}>
+        {status === 'loading' ? 'Answering...' : 'Ask'}
+      </button>
+      {(answer || status === 'loading') && (
+        <div className="payload-row payload-row-block">
+          <span className="payload-key">Answer</span>
+          <span className={`payload-value payload-value-left${status === 'error' ? ' payload-error' : ''}`}>
+            {status === 'loading' ? 'Thinking through the image...' : answer}
+          </span>
+        </div>
+      )}
+    </form>
+  )
+}
+
+function TranslatePayload({
+  action,
+  language,
+  translation,
+  status,
+  onLanguageChange,
+  onSubmit,
+}: {
+  action: Extract<ContextualAction, { type: 'TRANSLATE' }>
+  language: string
+  translation: string
+  status: 'idle' | 'loading' | 'done' | 'error'
+  onLanguageChange: (value: string) => void
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+}) {
+  return (
+    <form className="payload-form" onSubmit={onSubmit}>
+      <PayloadRow label="Detected Text" value={action.payload.detectedText} />
+      <label className="payload-field">
+        <span className="payload-key">Language</span>
+        <input
+          className="payload-input"
+          value={language}
+          onChange={(event) => onLanguageChange(event.target.value)}
+          placeholder="English, Spanish, Chinese..."
+        />
+      </label>
+      <button type="submit" className="sheet-primary sheet-inline-button" disabled={status === 'loading' || !language.trim()}>
+        {status === 'loading' ? 'Translating...' : 'Translate'}
+      </button>
+      {(translation || status === 'loading') && (
+        <div className="payload-row payload-row-block">
+          <span className="payload-key">Translation</span>
+          <span className={`payload-value payload-value-left${status === 'error' ? ' payload-error' : ''}`}>
+            {status === 'loading' ? 'Reading and translating the visible text...' : translation}
+          </span>
+        </div>
+      )}
+    </form>
+  )
+}
+
+function FallbackPayload({ action }: { action: FallbackAction }) {
+  return (
+    <div className="payload-stack">
+      <PayloadRow label={action.label} value="Ready." />
     </div>
   )
 }
@@ -1269,6 +1665,311 @@ function getReusableObservation(cachedObservation: CachedObservation | null) {
   }
 
   return cachedObservation
+}
+
+function canRunProcessedAction(_action: DisplayAction, status: AnalysisStatus) {
+  return status === 'done'
+}
+
+function loadSavedActionPresets(): Record<string, SavedActionPreset> {
+  if (typeof window === 'undefined') {
+    return {}
+  }
+
+  try {
+    const rawValue = window.localStorage.getItem(savedActionPresetsKey)
+    if (!rawValue) {
+      return {}
+    }
+
+    const parsedValue = JSON.parse(rawValue)
+    if (!parsedValue || typeof parsedValue !== 'object' || Array.isArray(parsedValue)) {
+      return {}
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsedValue).filter((entry): entry is [string, SavedActionPreset] => {
+        const [key, value] = entry
+        return (/^\d$/.test(key) || key === '`') && isSavedActionPreset(value)
+      }),
+    )
+  } catch {
+    return {}
+  }
+}
+
+function saveSavedActionPresets(presets: Record<string, SavedActionPreset>) {
+  window.localStorage.setItem(savedActionPresetsKey, JSON.stringify(presets))
+}
+
+function isSavedActionPreset(value: unknown): value is SavedActionPreset {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const preset = value as SavedActionPreset
+  return (
+    typeof preset.actionType === 'string' &&
+    preset.actionType in ACTION_TYPE_TO_ID &&
+    typeof preset.label === 'string' &&
+    typeof preset.savedAt === 'number' &&
+    Boolean(preset.params) &&
+    typeof preset.params === 'object' &&
+    !Array.isArray(preset.params)
+  )
+}
+
+function getNumberKey(event: KeyboardEvent) {
+  if (/^Numpad\d$/.test(event.code)) {
+    return {
+      source: 'numpad' as const,
+      value: event.code.replace('Numpad', ''),
+    }
+  }
+
+  if (/^Digit\d$/.test(event.code)) {
+    return {
+      source: 'top-row' as const,
+      value: event.code.replace('Digit', ''),
+    }
+  }
+
+  return null
+}
+
+function isControlKey(event: KeyboardEvent) {
+  return event.key === 'Control' || event.code === 'ControlLeft' || event.code === 'ControlRight'
+}
+
+function isBacktickKey(event: KeyboardEvent) {
+  return event.code === 'Backquote' || event.key === '`'
+}
+
+function isEscapeKey(event: KeyboardEvent) {
+  return event.key === 'Escape' || event.code === 'Escape'
+}
+
+function formatPresetKeyLabel(value: string) {
+  return value === '`' ? '`' : value
+}
+
+function shouldIgnoreNumpadSave(event: KeyboardEvent) {
+  return event.isComposing || event.repeat
+}
+
+function getStringParam(params: Record<string, unknown>, key: string) {
+  const value = params[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function buildActionPreset({
+  action,
+  summary,
+  contextualActions,
+  recommendation,
+  askQuestion,
+  askAnswer,
+  translateLanguage,
+  customTranslation,
+  extraParams,
+}: {
+  action: DisplayAction
+  summary: string
+  contextualActions: ContextualAction[]
+  recommendation: RecommendationResponse | null
+  askQuestion: string
+  askAnswer: string
+  translateLanguage: string
+  customTranslation: string
+  extraParams: Record<string, unknown>
+}): SavedActionPreset {
+  return {
+    actionType: action.type,
+    label: buildActionPresetLabel(action, {
+      translateLanguage,
+      askQuestion,
+      recommendation,
+    }),
+    params: {
+      ...buildActionPresetParams(action, {
+        summary,
+        contextualActions,
+        recommendation,
+        askQuestion,
+        askAnswer,
+        translateLanguage,
+        customTranslation,
+      }),
+      ...extraParams,
+    },
+    savedAt: Date.now(),
+  }
+}
+
+function buildActionPresetLabel(
+  action: DisplayAction,
+  {
+    translateLanguage,
+    askQuestion,
+    recommendation,
+  }: {
+    translateLanguage: string
+    askQuestion: string
+    recommendation: RecommendationResponse | null
+  },
+) {
+  if (action.type === 'TRANSLATE') {
+    const targetLanguage =
+      translateLanguage.trim() || getRecommendedParamString(recommendation, 'targetLanguage')
+    return targetLanguage ? `Translate - ${targetLanguage}` : 'Translate'
+  }
+
+  if (action.type === 'ASK') {
+    return askQuestion.trim() ? `Ask - ${truncateLabel(askQuestion.trim())}` : 'Ask'
+  }
+
+  return action.label
+}
+
+function buildActionPresetParams(
+  action: DisplayAction,
+  {
+    summary,
+    contextualActions,
+    recommendation,
+    askQuestion,
+    askAnswer,
+    translateLanguage,
+    customTranslation,
+  }: {
+    summary: string
+    contextualActions: ContextualAction[]
+    recommendation: RecommendationResponse | null
+    askQuestion: string
+    askAnswer: string
+    translateLanguage: string
+    customTranslation: string
+  },
+) {
+  if (action.type === 'TRANSLATE') {
+    return {
+      targetLanguage:
+        translateLanguage.trim() ||
+        getRecommendedParamString(recommendation, 'targetLanguage') ||
+        'English',
+      translation: customTranslation,
+    }
+  }
+
+  if (action.type === 'ASK') {
+    return {
+      question: askQuestion.trim() || getRecommendedParamString(recommendation, 'question') || '',
+      answer: askAnswer,
+    }
+  }
+
+  if (action.type === 'SEARCH') {
+    return {
+      query:
+        getRecommendedParamString(recommendation, 'query') ||
+        buildSearchQuery(summary, contextualActions),
+    }
+  }
+
+  if (action.type === 'OPEN_LINK') {
+    return {
+      url: getRecommendedParamString(recommendation, 'url') || action.payload.url,
+    }
+  }
+
+  return {
+    payload: isContextualAction(action) ? action.payload : action.payload,
+  }
+}
+
+function truncateLabel(value: string) {
+  return value.length <= 28 ? value : `${value.slice(0, 27)}...`
+}
+
+function getRecommendedParamString(
+  recommendation: RecommendationResponse | null,
+  key: string,
+) {
+  const value = recommendation?.recommended_params?.[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function getChosenActionParams(
+  action: DisplayAction,
+  recommendation: RecommendationResponse | null,
+): Record<string, unknown> | null {
+  if (recommendation?.recommended_action_type === action.type && recommendation.recommended_params) {
+    return recommendation.recommended_params
+  }
+
+  return null
+}
+
+function buildSearchUrl(summary: string, actions: ContextualAction[], recommendedQuery: string | null = null) {
+  if (recommendedQuery) {
+    return `https://www.google.com/search?q=${encodeURIComponent(recommendedQuery)}`
+  }
+
+  return `https://www.google.com/search?q=${encodeURIComponent(buildSearchQuery(summary, actions) || 'visual search')}`
+}
+
+function buildSearchQuery(summary: string, actions: ContextualAction[]) {
+  const actionText = actions
+    .map((action) => {
+      switch (action.type) {
+        case 'OPEN_LINK':
+          return action.payload.displayText || action.payload.url
+        case 'TRANSLATE':
+          return action.payload.detectedText
+        case 'SOLVE':
+          return action.payload.problemText
+        case 'ADD_CONTACT':
+          return joinNonEmpty([action.payload.name, action.payload.company, action.payload.website], ' ')
+        case 'SAVE_EXPENSE':
+          return joinNonEmpty([action.payload.merchant, action.payload.total, action.payload.category], ' ')
+        case 'SET_REMINDER':
+          return joinNonEmpty([action.payload.title, action.payload.dateTimeText], ' ')
+        case 'ADD_EVENT':
+          return joinNonEmpty([action.payload.title, action.payload.location, action.payload.date], ' ')
+      }
+    })
+    .filter(Boolean)
+    .join(' ')
+  const query = actionText ? normalizeSearchQuery(actionText) : buildSubjectSearchQuery(summary)
+  return query || 'visual search'
+}
+
+function normalizeSearchQuery(value: string | null) {
+  return (value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\b(no strong contextual action was detected|nothing notable was detected)\b/gi, '')
+    .replace(/\bthere is no visible text or information that suggests any of the supported actions\.?/gi, '')
+    .replace(/\bno visible text or information that suggests any of the supported actions\.?/gi, '')
+    .replace(/\bthe image shows\b/gi, '')
+    .replace(/\bthe image appears to show\b/gi, '')
+    .replace(/\bappears to be\b/gi, 'is')
+    .trim()
+}
+
+function buildSubjectSearchQuery(summary: string) {
+  const cleaned = normalizeSearchQuery(summary)
+  const firstSentence = cleaned
+    .split(/[.!?]/)
+    .map((sentence) => sentence.trim())
+    .find((sentence) => sentence.length > 0) || cleaned
+
+  return firstSentence
+    .replace(/\b(a|an|the)\s+/gi, '')
+    .replace(/\b(seated|sitting)\s+in\s+(a\s+)?chair\b/gi, '')
+    .replace(/\bbackground includes\b.*$/gi, '')
+    .replace(/\bwith a door\b.*$/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function getActionButtonLabel(action: DisplayAction) {

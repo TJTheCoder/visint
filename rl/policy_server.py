@@ -61,6 +61,7 @@ class RecommendRequest(BaseModel):
 class RecommendResponse(BaseModel):
     recommended_action_id: int
     recommended_action_type: str
+    recommended_params: dict[str, Any] = Field(default_factory=dict)
     confidence: float
     policy_debug: dict[str, Any]
 
@@ -72,6 +73,8 @@ class FeedbackRequest(BaseModel):
     source: Literal["manual", "recommendation"]
     recommended_action_id: int | None
     chosen_action_id: int | None
+    recommended_params: dict[str, Any] | None = None
+    chosen_params: dict[str, Any] | None = None
     accepted: bool
     reward: float
     allowed_action_ids: list[int]
@@ -138,16 +141,20 @@ async def recommend(payload: RecommendRequest) -> RecommendResponse:
         result.action_type = ACTION_ID_TO_TYPE[fallback_id]
         result.warning = "Policy recommendation was invalid and was replaced with a masked fallback."
 
+    recommended_params = recommend_action_params(result.action_type, payload.observation.model_dump(), replay_store)
+
     pending_recommendations[payload.episode_id] = {
         "observation": payload.observation.model_dump(),
         "observation_vector": observation_vector,
         "allowed_action_ids": allowed_action_ids,
         "recommended_action_id": result.action_id,
+        "recommended_params": recommended_params,
     }
 
     return RecommendResponse(
         recommended_action_id=result.action_id,
         recommended_action_type=result.action_type,
+        recommended_params=recommended_params,
         confidence=result.confidence,
         policy_debug={
             "allowed_action_ids": allowed_action_ids,
@@ -194,6 +201,8 @@ async def feedback(payload: FeedbackRequest) -> dict[str, Any]:
         source=payload.source,
         recommended_action_id=payload.recommended_action_id,
         chosen_action_id=payload.chosen_action_id,
+        recommended_params=payload.recommended_params or (pending or {}).get("recommended_params"),
+        chosen_params=payload.chosen_params,
         accepted=payload.accepted,
         reward=payload.reward,
     )
@@ -206,3 +215,126 @@ async def feedback(payload: FeedbackRequest) -> dict[str, Any]:
         "replay_size": replay_store.size,
         "checkpoint": trainer.last_checkpoint,
     }
+
+
+def recommend_action_params(action_type: str, observation: dict[str, Any], replay: ReplayStore) -> dict[str, Any]:
+    recent_params = latest_positive_params(action_type, replay)
+
+    if action_type == "TRANSLATE":
+        return {
+            "targetLanguage": recent_params.get("targetLanguage") or "English",
+        }
+
+    if action_type == "ASK":
+        return {
+            "question": recent_params.get("question") or build_default_question(observation),
+        }
+
+    if action_type == "SEARCH":
+        return {
+            "query": recent_params.get("query") or build_default_search_query(observation),
+        }
+
+    if action_type == "OPEN_LINK":
+        link_action = find_contextual_action(observation, "OPEN_LINK")
+        payload = link_action.get("payload", {}) if link_action else {}
+        return {
+            "url": payload.get("url"),
+        }
+
+    if action_type == "ADD_EVENT":
+        action = find_contextual_action(observation, "ADD_EVENT")
+        return {"event": action.get("payload", {}) if action else {}}
+
+    if action_type == "SET_REMINDER":
+        action = find_contextual_action(observation, "SET_REMINDER")
+        return {"reminder": action.get("payload", {}) if action else {}}
+
+    if action_type == "SAVE_EXPENSE":
+        action = find_contextual_action(observation, "SAVE_EXPENSE")
+        return {"expense": action.get("payload", {}) if action else {}}
+
+    if action_type == "ADD_CONTACT":
+        action = find_contextual_action(observation, "ADD_CONTACT")
+        return {"contact": action.get("payload", {}) if action else {}}
+
+    if action_type == "SOLVE":
+        action = find_contextual_action(observation, "SOLVE")
+        return {"solution": action.get("payload", {}) if action else {}}
+
+    return {}
+
+
+def latest_positive_params(action_type: str, replay: ReplayStore) -> dict[str, Any]:
+    action_id = ACTION_TYPE_TO_ID.get(action_type)
+
+    if action_id is None:
+        return {}
+
+    for record in reversed(replay.records):
+        if record.reward <= 0:
+            continue
+
+        if record.chosen_action_id != action_id:
+            continue
+
+        if isinstance(record.chosen_params, dict) and record.chosen_params:
+            return record.chosen_params
+
+        if isinstance(record.recommended_params, dict) and record.recommended_params:
+            return record.recommended_params
+
+    return {}
+
+
+def find_contextual_action(observation: dict[str, Any], action_type: str) -> dict[str, Any] | None:
+    actions = observation.get("actions", [])
+
+    if not isinstance(actions, list):
+        return None
+
+    for action in actions:
+        if isinstance(action, dict) and action.get("type") == action_type:
+            return action
+
+    return None
+
+
+def build_default_question(observation: dict[str, Any]) -> str:
+    scene_type = observation.get("scene_type")
+
+    if scene_type == "receipt":
+        return "What should I know about this receipt?"
+    if scene_type == "event":
+        return "What are the important details in this event?"
+    if scene_type == "contact":
+        return "What contact details are visible?"
+    if scene_type == "math":
+        return "Can you explain how to solve this?"
+    if scene_type == "foreign_text":
+        return "What does the visible text say?"
+
+    return "What is the main subject of this image?"
+
+
+def build_default_search_query(observation: dict[str, Any]) -> str:
+    summary = str(observation.get("summary") or "").strip()
+    actions = observation.get("actions", [])
+
+    for action in actions if isinstance(actions, list) else []:
+        if not isinstance(action, dict):
+            continue
+        payload = action.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        for key in ("title", "merchant", "name", "company", "displayText", "detectedText"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    if not summary:
+        return "visual search"
+
+    first_sentence = summary.replace("The image shows", "").replace("The image appears to show", "")
+    first_sentence = first_sentence.split(".")[0].strip()
+    return " ".join(first_sentence.split()) or "visual search"

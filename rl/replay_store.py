@@ -17,6 +17,8 @@ class ReplayRecord:
     source: str
     recommended_action_id: int | None
     chosen_action_id: int | None
+    recommended_params: dict | None
+    chosen_params: dict | None
     accepted: bool
     reward: float
     created_at: str
@@ -58,6 +60,8 @@ class ReplayStore:
                         source=payload["source"],
                         recommended_action_id=payload.get("recommended_action_id"),
                         chosen_action_id=payload.get("chosen_action_id"),
+                        recommended_params=payload.get("recommended_params"),
+                        chosen_params=payload.get("chosen_params"),
                         accepted=payload["accepted"],
                         reward=payload["reward"],
                         created_at=payload["created_at"],
@@ -85,6 +89,8 @@ class ReplayStore:
         chosen_action_id: int | None,
         accepted: bool,
         reward: float,
+        recommended_params: dict | None = None,
+        chosen_params: dict | None = None,
     ) -> ReplayRecord:
         record = ReplayRecord(
             episode_id=episode_id,
@@ -94,6 +100,8 @@ class ReplayStore:
             source=source,
             recommended_action_id=recommended_action_id,
             chosen_action_id=chosen_action_id,
+            recommended_params=recommended_params,
+            chosen_params=chosen_params,
             accepted=accepted,
             reward=reward,
             created_at=datetime.now(timezone.utc).isoformat(),

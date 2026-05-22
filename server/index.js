@@ -392,6 +392,23 @@ const requestSchema = z
   })
   .strict()
 
+const askImageRequestSchema = z
+  .object({
+    imageDataUrl: z.string().min(1),
+    question: z.string().trim().min(1).max(800),
+    summary: z.string().optional(),
+  })
+  .strict()
+
+const translateImageRequestSchema = z
+  .object({
+    imageDataUrl: z.string().min(1),
+    targetLanguage: z.string().trim().min(1).max(80),
+    detectedText: z.string().optional(),
+    summary: z.string().optional(),
+  })
+  .strict()
+
 const app = express()
 let ocrWorkerPromise = null
 
@@ -448,6 +465,50 @@ app.post('/api/analyze-image', async (req, res) => {
   }
 })
 
+app.post('/api/ask-image', async (req, res) => {
+  const parsedRequest = askImageRequestSchema.safeParse(req.body)
+
+  if (!parsedRequest.success) {
+    res.status(400).json({
+      error: 'Missing or invalid image question payload.',
+      details: parsedRequest.error.flatten(),
+    })
+    return
+  }
+
+  try {
+    const answer = await askImageWithOllama(parsedRequest.data)
+    res.json({ answer })
+  } catch (error) {
+    console.error('Image question failed:', error)
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Could not answer question.',
+    })
+  }
+})
+
+app.post('/api/translate-image', async (req, res) => {
+  const parsedRequest = translateImageRequestSchema.safeParse(req.body)
+
+  if (!parsedRequest.success) {
+    res.status(400).json({
+      error: 'Missing or invalid image translation payload.',
+      details: parsedRequest.error.flatten(),
+    })
+    return
+  }
+
+  try {
+    const translation = await translateImageWithOllama(parsedRequest.data)
+    res.json({ translation })
+  } catch (error) {
+    console.error('Image translation failed:', error)
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Could not translate image text.',
+    })
+  }
+})
+
 await bootstrap()
 
 async function analyzeWithOllama(imageDataUrl) {
@@ -495,6 +556,108 @@ async function analyzeWithOllama(imageDataUrl) {
 
   const parsed = analysisSchema.parse(JSON.parse(content))
   return normalizeAnalysis(parsed, hints)
+}
+
+async function askImageWithOllama({ imageDataUrl, question, summary }) {
+  const base64Image = getBase64Image(imageDataUrl)
+
+  const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: ollamaModel,
+      stream: false,
+      options: {
+        temperature: 0.2,
+      },
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You answer questions about a captured image for a Visual Intelligence-style camera app. Be concise, grounded in visible evidence, and say when the image does not contain enough information.',
+        },
+        {
+          role: 'user',
+          content: [
+            summary ? `Previous scene summary: ${summary}` : null,
+            `Question: ${question}`,
+          ]
+            .filter(Boolean)
+            .join('\n'),
+          images: [base64Image],
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(120000),
+  })
+
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`Ollama request failed: ${response.status} ${body}`)
+  }
+
+  const data = await response.json()
+  const content = data?.message?.content
+
+  if (typeof content !== 'string' || content.trim().length === 0) {
+    throw new Error('Ollama returned an empty answer.')
+  }
+
+  return normalizeWhitespace(content)
+}
+
+async function translateImageWithOllama({ imageDataUrl, targetLanguage, detectedText, summary }) {
+  const base64Image = getBase64Image(imageDataUrl)
+
+  const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: ollamaModel,
+      stream: false,
+      options: {
+        temperature: 0,
+      },
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You translate visible text in a captured image. Return only the translation text, no commentary. If no readable text is visible, say "No readable text found."',
+        },
+        {
+          role: 'user',
+          content: [
+            `Target language: ${targetLanguage}`,
+            detectedText ? `Detected text hint: ${detectedText}` : null,
+            summary ? `Previous scene summary: ${summary}` : null,
+            'Translate the visible text in the image into the target language.',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+          images: [base64Image],
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(120000),
+  })
+
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`Ollama request failed: ${response.status} ${body}`)
+  }
+
+  const data = await response.json()
+  const content = data?.message?.content
+
+  if (typeof content !== 'string' || content.trim().length === 0) {
+    throw new Error('Ollama returned an empty translation.')
+  }
+
+  return normalizeWhitespace(content)
 }
 
 async function bootstrap() {
@@ -596,8 +759,8 @@ function buildUserPrompt(hints) {
     'Inspect the attached captured camera image and return only JSON matching the provided schema.',
     'Supported actions: TRANSLATE, OPEN_LINK, SOLVE, ADD_CONTACT, SAVE_EXPENSE, SET_REMINDER, ADD_EVENT.',
     'Action rules:',
-    '1. TRANSLATE only when visible non-English text exists.',
-    '2. OPEN_LINK only when a QR code, URL, domain, or obvious link text exists.',
+    '1. TRANSLATE whenever visible text appears to be non-English, even if OCR is incomplete.',
+    '2. OPEN_LINK only when a QR code, URL, domain, or obvious link text exists. Never use placeholder URLs like example.com.',
     '3. SOLVE only for math problems, worksheets, homework, puzzles, code, or error screenshots.',
     '4. ADD_CONTACT only for business cards, email signatures, or flyers with personal contact information.',
     '5. SAVE_EXPENSE only for receipts, invoices, restaurant checks, or purchase confirmations.',
@@ -687,9 +850,129 @@ function getBase64Image(imageDataUrl) {
 }
 
 function readQRCode(image) {
+  const candidates = buildQrCandidates(image)
+
+  for (const candidate of candidates) {
+    const code = jsQR(candidate.data, candidate.width, candidate.height, {
+      inversionAttempts: 'attemptBoth',
+    })
+
+    if (code?.data) {
+      return code.data
+    }
+  }
+
+  return null
+}
+
+function buildQrCandidates(image) {
   const { data, width, height } = image.bitmap
-  const code = jsQR(new Uint8ClampedArray(data), width, height)
-  return code?.data || null
+  const crops = [
+    [0, 0, width, height],
+    [Math.floor(width * 0.15), Math.floor(height * 0.15), Math.floor(width * 0.7), Math.floor(height * 0.7)],
+    [0, 0, Math.ceil(width / 2), Math.ceil(height / 2)],
+    [Math.floor(width / 2), 0, Math.ceil(width / 2), Math.ceil(height / 2)],
+    [0, Math.floor(height / 2), Math.ceil(width / 2), Math.ceil(height / 2)],
+    [Math.floor(width / 2), Math.floor(height / 2), Math.ceil(width / 2), Math.ceil(height / 2)],
+  ]
+  const candidates = []
+
+  for (const [x, y, cropWidth, cropHeight] of crops) {
+    const cropped = cropBitmap(data, width, height, x, y, cropWidth, cropHeight)
+    const scaled = scaleCandidate(cropped)
+
+    candidates.push(cropped)
+    candidates.push(scaled)
+
+    for (const threshold of [105, 125, 145, 165, 185]) {
+      candidates.push(thresholdCandidate(scaled, threshold, false))
+      candidates.push(thresholdCandidate(scaled, threshold, true))
+    }
+  }
+
+  return candidates
+}
+
+function cropBitmap(sourceData, sourceWidth, sourceHeight, x, y, width, height) {
+  const safeX = Math.max(0, Math.min(sourceWidth - 1, x))
+  const safeY = Math.max(0, Math.min(sourceHeight - 1, y))
+  const safeWidth = Math.max(1, Math.min(width, sourceWidth - safeX))
+  const safeHeight = Math.max(1, Math.min(height, sourceHeight - safeY))
+  const target = new Uint8ClampedArray(safeWidth * safeHeight * 4)
+
+  for (let row = 0; row < safeHeight; row += 1) {
+    for (let column = 0; column < safeWidth; column += 1) {
+      const sourceIndex = ((safeY + row) * sourceWidth + safeX + column) * 4
+      const targetIndex = (row * safeWidth + column) * 4
+      target[targetIndex] = sourceData[sourceIndex]
+      target[targetIndex + 1] = sourceData[sourceIndex + 1]
+      target[targetIndex + 2] = sourceData[sourceIndex + 2]
+      target[targetIndex + 3] = sourceData[sourceIndex + 3]
+    }
+  }
+
+  return {
+    data: target,
+    width: safeWidth,
+    height: safeHeight,
+  }
+}
+
+function scaleCandidate(candidate) {
+  const longestSide = Math.max(candidate.width, candidate.height)
+
+  if (longestSide >= 650) {
+    return candidate
+  }
+
+  const scale = Math.ceil(650 / longestSide)
+  const targetWidth = candidate.width * scale
+  const targetHeight = candidate.height * scale
+  const target = new Uint8ClampedArray(targetWidth * targetHeight * 4)
+
+  for (let row = 0; row < targetHeight; row += 1) {
+    for (let column = 0; column < targetWidth; column += 1) {
+      const sourceColumn = Math.floor(column / scale)
+      const sourceRow = Math.floor(row / scale)
+      const sourceIndex = (sourceRow * candidate.width + sourceColumn) * 4
+      const targetIndex = (row * targetWidth + column) * 4
+      target[targetIndex] = candidate.data[sourceIndex]
+      target[targetIndex + 1] = candidate.data[sourceIndex + 1]
+      target[targetIndex + 2] = candidate.data[sourceIndex + 2]
+      target[targetIndex + 3] = candidate.data[sourceIndex + 3]
+    }
+  }
+
+  return {
+    data: target,
+    width: targetWidth,
+    height: targetHeight,
+  }
+}
+
+function thresholdCandidate(candidate, threshold, invert) {
+  const target = new Uint8ClampedArray(candidate.data.length)
+
+  for (let index = 0; index < candidate.data.length; index += 4) {
+    const red = candidate.data[index]
+    const green = candidate.data[index + 1]
+    const blue = candidate.data[index + 2]
+    const alpha = candidate.data[index + 3]
+    const luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+    const value = luminance > threshold ? 255 : 0
+    const output = invert ? 255 - value : value
+
+    target[index] = output
+    target[index + 1] = output
+    target[index + 2] = output
+    target[index + 3] = alpha
+  }
+
+  return {
+    data: target,
+    width: candidate.width,
+    height: candidate.height,
+  }
 }
 
 async function readText(buffer) {
@@ -710,6 +993,7 @@ function normalizeAnalysis(analysis, hints) {
   const qrUrl = findUrl(hints.qrText)
   const ocrUrl = findUrl(hints.ocrText)
   const evidenceText = normalizeWhitespace([hints.qrText, hints.ocrText].filter(Boolean).join('\n'))
+  const detectedUrl = qrUrl || ocrUrl
 
   const actions = filterActionsByEvidence(analysis.actions, {
     evidenceText,
@@ -720,27 +1004,30 @@ function normalizeAnalysis(analysis, hints) {
     primarySceneType: analysis.primarySceneType,
   })
 
+  if (detectedUrl) {
+    const detectedAction = {
+      type: 'OPEN_LINK',
+      label: 'Open Link',
+      confidence: qrUrl ? 0.98 : 0.9,
+      payload: {
+        url: normalizeUrl(detectedUrl),
+        displayText: hints.qrText || detectedUrl,
+      },
+    }
+    const existingIndex = actions.findIndex((action) => action.type === 'OPEN_LINK')
+
+    if (existingIndex === -1) {
+      actions.unshift(detectedAction)
+    } else {
+      actions[existingIndex] = detectedAction
+    }
+  }
+
   maybeAddTranslateFromSummary(actions, {
     evidenceText,
     summary: analysis.summary,
     primarySceneType: analysis.primarySceneType,
   })
-
-  if (!actions.some((action) => action.type === 'OPEN_LINK')) {
-    const detectedUrl = qrUrl || ocrUrl
-
-    if (detectedUrl) {
-      actions.unshift({
-        type: 'OPEN_LINK',
-        label: 'Open Link',
-        confidence: qrUrl ? 0.98 : 0.9,
-        payload: {
-          url: normalizeUrl(detectedUrl),
-          displayText: hints.qrText || detectedUrl,
-        },
-      })
-    }
-  }
 
   return {
     ...analysis,
@@ -780,9 +1067,10 @@ function filterActionsByEvidence(actions, hints) {
   const reminderKeywords = /(parking|expires|expiration|pickup|deadline|due|return by|valid until|max stay|minutes|hours)/i
   const eventKeywords = /(concert|meetup|conference|event|invitation|class|workshop|session|tickets|doors open|live tonight)/i
   const solveKeywords = /(solve|simplify|evaluate|equation|find x|integral|derivative|worksheet|homework|error|exception|traceback|syntaxerror|referenceerror)/i
-  const translateKeywords = /[^\u0000-\u007f]|hola|gracias|bonjour|merci|salida|sortie|entrada|ferme|cerrado|chinese|japanese|korean|spanish|french|german|arabic|hindi/i
+  const translateKeywords = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f]|hola|gracias|bonjour|merci|salida|sortie|entrada|ferme|cerrado|chinese|japanese|korean|spanish|french|german|arabic|hindi/i
+  const summaryDeniesText = /(no visible text|no text|there is no visible text|without visible text|no readable text)/i.test(summary)
   const summarySuggestsTranslation =
-    hints.primarySceneType === 'foreign_text' || detectLanguageFromSummary(summary) !== null
+    !summaryDeniesText && (detectLanguageFromSummary(summary) !== null || suggestsForeignText(summary))
 
   if (!hints.qrUrl && sparseText && !summarySuggestsTranslation) {
     return []
@@ -791,7 +1079,13 @@ function filterActionsByEvidence(actions, hints) {
   return actions.filter((action) => {
     switch (action.type) {
       case 'OPEN_LINK':
-        return Boolean(hints.qrUrl || hints.ocrUrl || findUrl(action.payload.url) || /\blink|url|website|qr\b/i.test(summary))
+        return hasUrlEvidence(action.payload.url, {
+          evidenceText: text,
+          qrUrl: hints.qrUrl,
+          ocrUrl: hints.ocrUrl,
+          summary,
+          primarySceneType: hints.primarySceneType,
+        })
       case 'SAVE_EXPENSE':
         return receiptKeywords.test(combinedText) || money.length >= 2
       case 'ADD_CONTACT':
@@ -803,7 +1097,7 @@ function filterActionsByEvidence(actions, hints) {
       case 'SOLVE':
         return solveKeywords.test(combinedText) || (/[=][^=]/.test(combinedText) && /[\dxy+\-*/^]/i.test(combinedText))
       case 'TRANSLATE':
-        return translateKeywords.test(combinedText) || summarySuggestsTranslation
+        return !summaryDeniesText && (translateKeywords.test(combinedText) || summarySuggestsTranslation)
       default:
         return false
     }
@@ -818,7 +1112,8 @@ function maybeAddTranslateFromSummary(actions, hints) {
   const summary = normalizeWhitespace(hints.summary || '')
   const sourceLanguage =
     detectLanguageFromSummary(summary) ||
-    (hints.primarySceneType === 'foreign_text' ? 'unknown' : null)
+    (suggestsForeignText(summary) ? 'unknown' : null) ||
+    (hasMeaningfulForeignEvidence(hints.evidenceText) ? 'unknown' : null)
 
   if (!sourceLanguage) {
     return
@@ -842,7 +1137,7 @@ function maybeAddTranslateFromSummary(actions, hints) {
 function detectLanguageFromSummary(summary) {
   const lower = summary.toLowerCase()
 
-  if (lower.includes('chinese')) return 'Chinese'
+  if (lower.includes('chinese') || lower.includes('mandarin') || lower.includes('cantonese')) return 'Chinese'
   if (lower.includes('japanese')) return 'Japanese'
   if (lower.includes('korean')) return 'Korean'
   if (lower.includes('spanish')) return 'Spanish'
@@ -850,8 +1145,25 @@ function detectLanguageFromSummary(summary) {
   if (lower.includes('german')) return 'German'
   if (lower.includes('arabic')) return 'Arabic'
   if (lower.includes('hindi')) return 'Hindi'
+  if (lower.includes('portuguese')) return 'Portuguese'
+  if (lower.includes('italian')) return 'Italian'
+  if (lower.includes('russian') || lower.includes('cyrillic')) return 'Russian'
+  if (lower.includes('thai')) return 'Thai'
+  if (lower.includes('vietnamese')) return 'Vietnamese'
 
   return null
+}
+
+function suggestsForeignText(summary) {
+  if (/(no visible text|no text|there is no visible text|without visible text|no readable text)/i.test(summary)) {
+    return false
+  }
+
+  return /(non-english|foreign[-\s]?language|another language|untranslated|appears to be in|text in a language|characters|script|visible text is not english)/i.test(summary)
+}
+
+function hasMeaningfulForeignEvidence(text) {
+  return /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f]/.test(text || '')
 }
 
 function inferSummaryFromActions(actions) {
@@ -934,6 +1246,46 @@ function findUrl(text) {
 
 function normalizeUrl(url) {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`
+}
+
+function hasUrlEvidence(url, { evidenceText, qrUrl, ocrUrl, summary, primarySceneType }) {
+  if (isPlaceholderUrl(url)) {
+    return false
+  }
+
+  if (qrUrl || ocrUrl) {
+    return true
+  }
+
+  const detectedUrl = findUrl(url)
+
+  if (!detectedUrl) {
+    return false
+  }
+
+  const normalizedNeedle = stripUrlForComparison(normalizeUrl(detectedUrl))
+  const normalizedEvidence = stripUrlForComparison(evidenceText)
+  if (normalizedNeedle && normalizedEvidence.includes(normalizedNeedle)) {
+    return true
+  }
+
+  return (
+    primarySceneType === 'link' ||
+    /\b(qr|qr code|url|link|website|domain)\b/i.test(summary || '')
+  )
+}
+
+function stripUrlForComparison(value) {
+  return normalizeWhitespace(value || '')
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/[)\].,;!?]+$/g, '')
+}
+
+function isPlaceholderUrl(url) {
+  const normalized = stripUrlForComparison(normalizeUrl(url || ''))
+  return /^(example\.com|example\.org|example\.net|localhost|127\.0\.0\.1)(?:\/|$)/i.test(normalized)
 }
 
 function extractDate(text) {
